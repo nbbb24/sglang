@@ -25,6 +25,9 @@ from sglang.srt.observability.metrics_collector import StorageMetrics
 
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
 SETUP_TIMEOUT = 600  # 10min
+DEFAULT_MOONCAKE_TRACE_LOGGING = True
+# <= 0 means no limit (print all keys).
+DEFAULT_MOONCAKE_TRACE_MAX_KEYS = 0
 
 logger = logging.getLogger(__name__)
 
@@ -443,6 +446,16 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             self.backup_pgs = []
             self.prefetch_bandwidth = []
             self.backup_bandwidth = []
+            self.enable_trace_logging = os.getenv(
+                "SGLANG_MOONCAKE_TRACE_LOGGING",
+                "1" if DEFAULT_MOONCAKE_TRACE_LOGGING else "0",
+            ).lower() in ("1", "true", "yes", "on")
+            self.trace_max_keys = int(
+                os.getenv(
+                    "SGLANG_MOONCAKE_TRACE_MAX_KEYS",
+                    str(DEFAULT_MOONCAKE_TRACE_MAX_KEYS),
+                )
+            )
 
         except ValueError as e:
             logger.error("Configuration loading failed: %s", e)
@@ -450,6 +463,19 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         except Exception as exc:
             logger.error("An error occurred while loading the configuration: %s", exc)
             raise
+
+    def _trace_enabled(self) -> bool:
+        return self.enable_trace_logging and logger.isEnabledFor(logging.INFO)
+
+    def _sample_keys(self, keys: List[str]) -> List[str]:
+        if self.trace_max_keys <= 0:
+            return list(keys)
+        return list(keys[: self.trace_max_keys])
+
+    def _trace_event(self, payload: dict) -> None:
+        if not self._trace_enabled():
+            return
+        logger.info("[MooncakeTrace] %s", payload)
 
     def check_server(self):
         master_server_ip = self.config.master_server_address.split(":")[0]
@@ -626,17 +652,61 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 exist_result = self._batch_exist(key_strs)
                 io_results = [0 if state == 1 else -1 for state in exist_result]
                 missing_idx = [i for i, state in enumerate(exist_result) if state != 1]
+                self._trace_event(
+                    {
+                        "op": f"batch_set_v2_exist:{transfer.name}",
+                        "flow": "host->store",
+                        "total_component_keys": len(key_strs),
+                        "already_exist_keys": len(key_strs) - len(missing_idx),
+                        "missing_keys": len(missing_idx),
+                        "sample_keys": self._sample_keys(key_strs),
+                    }
+                )
                 if missing_idx:
+                    start_time = time.perf_counter()
                     put_results = self._put_batch_zero_copy_impl(
                         [key_strs[i] for i in missing_idx],
                         [ptr_list[i] for i in missing_idx],
                         [element_size_list[i] for i in missing_idx],
                     )
+                    elapsed_ms = (time.perf_counter() - start_time) * 1000
+                    ok = sum(1 for r in put_results if r == 0)
+                    self._trace_event(
+                        {
+                            "op": f"batch_set_v2_put:{transfer.name}",
+                            "flow": "host->store",
+                            "total_component_keys": len(put_results),
+                            "ok_keys": ok,
+                            "failed_keys": len(put_results) - ok,
+                            "value_bytes": int(
+                                sum(element_size_list[i] for i in missing_idx)
+                            ),
+                            "duration_ms": round(elapsed_ms, 3),
+                            "sample_keys": self._sample_keys(
+                                [key_strs[i] for i in missing_idx]
+                            ),
+                        }
+                    )
                     for i, res in zip(missing_idx, put_results):
                         io_results[i] = res
             else:
+                start_time = time.perf_counter()
                 io_results = self._get_batch_zero_copy_impl(
                     key_strs, ptr_list, element_size_list
+                )
+                elapsed_ms = (time.perf_counter() - start_time) * 1000
+                ok = sum(1 for r in io_results if r > 0)
+                self._trace_event(
+                    {
+                        "op": f"batch_get_v2:{transfer.name}",
+                        "flow": "store->host",
+                        "total_component_keys": len(io_results),
+                        "hit_keys": ok,
+                        "miss_keys": len(io_results) - ok,
+                        "value_bytes": int(sum(element_size_list)),
+                        "duration_ms": round(elapsed_ms, 3),
+                        "sample_keys": self._sample_keys(key_strs),
+                    }
                 )
             results[transfer.name] = self._batch_postprocess(
                 io_results, is_set_operate=is_set, key_multiplier=key_multiplier
@@ -746,6 +816,19 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             key_strs, buffer_ptrs, buffer_sizes
         )
         end_time = time.perf_counter()
+        hit_keys = sum(1 for r in get_results if r > 0)
+        self._trace_event(
+            {
+                "op": "batch_get_v1",
+                "flow": "store->host",
+                "total_component_keys": len(get_results),
+                "hit_keys": hit_keys,
+                "miss_keys": len(get_results) - hit_keys,
+                "value_bytes": int(sum(buffer_sizes)),
+                "duration_ms": round((end_time - start_time) * 1000, 3),
+                "sample_keys": self._sample_keys(key_strs),
+            }
+        )
 
         if self.enable_storage_metrics:
             self.prefetch_pgs.append(len(keys))
@@ -766,6 +849,17 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
         exist_result = self._batch_exist(key_strs)
+        existing_keys = sum(1 for state in exist_result if state == 1)
+        self._trace_event(
+            {
+                "op": "batch_set_v1_exist",
+                "flow": "host->store",
+                "total_component_keys": len(exist_result),
+                "already_exist_keys": existing_keys,
+                "missing_keys": len(exist_result) - existing_keys,
+                "sample_keys": self._sample_keys(key_strs),
+            }
+        )
 
         set_keys = []
         set_buffer_ptrs = []
@@ -788,6 +882,19 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 set_keys, set_buffer_ptrs, set_buffer_sizes
             )
             end_time = time.perf_counter()
+            ok = sum(1 for r in put_results if r == 0)
+            self._trace_event(
+                {
+                    "op": "batch_set_v1_put",
+                    "flow": "host->store",
+                    "total_component_keys": len(put_results),
+                    "ok_keys": ok,
+                    "failed_keys": len(put_results) - ok,
+                    "value_bytes": int(sum(set_buffer_sizes)),
+                    "duration_ms": round((end_time - start_time) * 1000, 3),
+                    "sample_keys": self._sample_keys(set_keys),
+                }
+            )
 
             if self.enable_storage_metrics:
                 self.backup_pgs.append(len(set_keys))
@@ -902,6 +1009,19 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             keys, target_locations, target_sizes
         )
         end_time = time.perf_counter()
+        hit_keys = sum(1 for r in get_result if r > 0)
+        self._trace_event(
+            {
+                "op": "batch_get",
+                "flow": "store->host",
+                "total_component_keys": len(get_result),
+                "hit_keys": hit_keys,
+                "miss_keys": len(get_result) - hit_keys,
+                "value_bytes": int(sum(target_sizes)),
+                "duration_ms": round((end_time - start_time) * 1000, 3),
+                "sample_keys": self._sample_keys(keys),
+            }
+        )
 
         if self.is_mla_backend:
             key_multiplier = 1
@@ -947,6 +1067,21 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 key_multiplier = 2
 
         exist_result = self._batch_exist(query_keys)
+        hit_component_keys = 0
+        for state in exist_result:
+            if state != 1:
+                break
+            hit_component_keys += 1
+        self._trace_event(
+            {
+                "op": "batch_exists",
+                "flow": "query",
+                "total_component_keys": len(query_keys),
+                "hit_component_keys": hit_component_keys,
+                "miss_component_keys": len(query_keys) - hit_component_keys,
+                "sample_keys": self._sample_keys(query_keys),
+            }
+        )
         for i in range(len(query_keys)):
             if exist_result[i] != 1:
                 return i // key_multiplier
