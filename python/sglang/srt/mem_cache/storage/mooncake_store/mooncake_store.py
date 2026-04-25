@@ -456,6 +456,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     str(DEFAULT_MOONCAKE_TRACE_MAX_KEYS),
                 )
             )
+            logger.warning(
+                "[MooncakeTraceInit] enabled=%s max_keys=%s",
+                self.enable_trace_logging,
+                self.trace_max_keys,
+            )
 
         except ValueError as e:
             logger.error("Configuration loading failed: %s", e)
